@@ -20,6 +20,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
+    SupportsRecirculation,
 )
 from vllm.model_executor.models.kimi_k25 import KimiK25MediaPixelInputs
 from vllm.model_executor.models.kimi_k25_vit import (
@@ -27,6 +28,7 @@ from vllm.model_executor.models.kimi_k25_vit import (
     MoonViT3dPretrainedModel,
     vision_tower_forward,
 )
+from vllm.model_executor.models.recirculation import RecirculationCapabilities
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -61,10 +63,18 @@ class KimiK3ForConditionalGeneration(
     SupportsEagle3,
     HasInnerState,
     IsHybrid,
+    SupportsRecirculation,
 ):
     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
 
     supports_encoder_tp_data = True
+
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.get_recirculation_capabilities() is not None
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.language_model.get_recirculation_capabilities()
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -203,6 +213,9 @@ class KimiK3ForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs: object,
     ) -> IntermediateTensors:
         if intermediate_tensors is not None:
@@ -212,6 +225,9 @@ class KimiK3ForConditionalGeneration(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
         )
         return hidden_states
 

@@ -20,8 +20,10 @@ from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsPP,
+    SupportsRecirculation,
     SupportsTranscription,
 )
+from vllm.model_executor.models.recirculation import RecirculationCapabilities
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -348,6 +350,7 @@ class KimiAudioForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
     SupportsPP,
+    SupportsRecirculation,
     SupportsTranscription,
 ):
     """Kimi-Audio model for ASR transcription."""
@@ -430,6 +433,13 @@ class KimiAudioForConditionalGeneration(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.get_recirculation_capabilities() is not None
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.language_model.get_recirculation_capabilities()
 
     def _parse_and_validate_audio_input(
         self, **kwargs: object
@@ -551,6 +561,9 @@ class KimiAudioForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         if intermediate_tensors is not None:
@@ -561,6 +574,9 @@ class KimiAudioForConditionalGeneration(
             positions,
             intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
         )
 
         return hidden_states

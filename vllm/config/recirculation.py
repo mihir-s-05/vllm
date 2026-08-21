@@ -3,8 +3,11 @@
 
 from dataclasses import dataclass
 from numbers import Real
+from typing import Literal
 
 import torch
+
+AttnResRecirculationMode = Literal["prefix", "bank", "broadcast"]
 
 
 @dataclass(frozen=True)
@@ -17,6 +20,7 @@ class RecirculationConfig:
     beta: float | None = None
     ramp_tokens: int = 0
     wavefront: bool = False
+    attn_res_mode: AttnResRecirculationMode | None = None
 
     @classmethod
     def from_hf_config(cls, hf_config: object) -> "RecirculationConfig | None":
@@ -37,6 +41,7 @@ class RecirculationConfig:
             "beta",
             "ramp_tokens",
             "wavefront",
+            "attn_res_mode",
         }
         unknown_keys = raw_config.keys() - valid_keys
         if unknown_keys:
@@ -55,6 +60,7 @@ class RecirculationConfig:
             beta=raw_config.get("beta"),
             ramp_tokens=raw_config.get("ramp_tokens", 0),
             wavefront=raw_config.get("wavefront", False),
+            attn_res_mode=raw_config.get("attn_res_mode"),
         )
         num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
         if isinstance(num_hidden_layers, bool) or not isinstance(
@@ -84,6 +90,8 @@ class RecirculationConfig:
             raise ValueError("ramp_tokens must be non-negative")
         if type(self.wavefront) is not bool:
             raise ValueError("wavefront must be a boolean")
+        if self.attn_res_mode not in (None, "prefix", "bank", "broadcast"):
+            raise ValueError("attn_res_mode must be one of: prefix, bank, broadcast")
 
         coefficients = {"alpha": self.alpha}
         if self.beta is not None:
@@ -126,3 +134,31 @@ class RecirculationConfig:
         beta = 1.0 - alpha if self.beta is None else self.beta
         mixed = beta * destination_float + alpha * normalized_source
         return mixed.to(dtype=destination.dtype)
+
+    def mix_attn_res_state(
+        self,
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        block_bank: torch.Tensor,
+        positions: torch.Tensor,
+        source_num_blocks: int,
+        destination_num_blocks: int,
+    ) -> torch.Tensor:
+        """Mix one of the experimental Kimi-K3 AttnRes state mappings."""
+        mode = self.attn_res_mode
+        if mode is None:
+            raise ValueError("Kimi-K3 AttnRes requires attn_res_mode")
+        if not 0 <= destination_num_blocks <= source_num_blocks <= block_bank.size(1):
+            raise ValueError("Invalid AttnRes block counts for Recirculation")
+
+        recirculated = self.mix(source, destination, positions)
+        if mode == "bank" and destination_num_blocks:
+            source_start = source_num_blocks - destination_num_blocks
+            source_blocks = block_bank[:, source_start:source_num_blocks, :]
+            destination_blocks = block_bank[:, :destination_num_blocks, :]
+            destination_blocks.copy_(
+                self.mix(source_blocks, destination_blocks, positions)
+            )
+        elif mode == "broadcast" and destination_num_blocks:
+            block_bank[:, :destination_num_blocks, :].copy_(recirculated.unsqueeze(1))
+        return recirculated
