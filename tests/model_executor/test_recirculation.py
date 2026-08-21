@@ -28,6 +28,10 @@ from vllm.model_executor.models.recirculation import (
     RecirculationDecoderMixin,
 )
 from vllm.model_executor.models.step3p5 import Step3p5Model
+from vllm.models.minimax_m3.nvidia.model import (
+    MiniMaxM3Model,
+    MiniMaxM3SparseForCausalLM,
+)
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -262,3 +266,47 @@ def test_gemma4_per_layer_embeddings_are_serial_only() -> None:
     assert capabilities is not None
     assert capabilities.serial
     assert not capabilities.wavefront
+
+
+def test_minimax_m3_top_level_advertises_serial_engine_capability() -> None:
+    model = cast(MiniMaxM3Model, object.__new__(MiniMaxM3Model))
+    causal_lm = MiniMaxM3SparseForCausalLM.__new__(MiniMaxM3SparseForCausalLM)
+    nn.Module.__init__(causal_lm)
+    causal_lm.model = model
+
+    assert supports_recirculation(causal_lm)
+    capabilities = causal_lm.get_recirculation_capabilities()
+    assert capabilities is not None
+    assert capabilities.adapter == "minimax_m3_sparse_moe"
+    assert not capabilities.wavefront
+
+
+def test_minimax_m3_uses_serial_recirculation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.models.minimax_m3.nvidia.model.get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    calls: list[int] = []
+    model = cast(MiniMaxM3Model, object.__new__(MiniMaxM3Model))
+    nn.Module.__init__(model)
+    model.start_layer = 0
+    model.end_layer = 3
+    model.layers = nn.ModuleList([_AdditiveLayer(i, calls) for i in range(3)])
+    model.norm = _FinalNorm()
+    model.recirculation_config = RecirculationConfig(
+        source_layer=1,
+        destination_layer=0,
+        alpha=0.2,
+    )
+
+    output = model.forward(
+        input_ids=None,
+        positions=torch.tensor([0]),
+        intermediate_tensors=None,
+        inputs_embeds=torch.zeros(1, 2),
+    )
+
+    torch.testing.assert_close(output, torch.full((1, 2), 6.0))
+    assert calls == [0, 1, 2, 1, 2]
