@@ -35,6 +35,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
     ROCMAiterMLASparseBackend,
@@ -139,6 +140,240 @@ def get_vllm_config():
         parallel_config=parallel_config,
     )
     return vllm_config
+
+
+def _make_recirculation_wavefront_runner() -> GPUModelRunner:
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model_config = SimpleNamespace(runner_type="generate")
+    runner.scheduler_config = SimpleNamespace(
+        max_num_seqs=1,
+        long_prefill_token_threshold=1,
+    )
+    runner.cache_config = SimpleNamespace(enable_prefix_caching=False)
+    runner.speculative_config = None
+    runner.parallel_config = SimpleNamespace(
+        use_ubatching=False,
+        decode_context_parallel_size=1,
+        data_parallel_size=1,
+    )
+    runner.compilation_config = SimpleNamespace(
+        pass_config=SimpleNamespace(enable_sp=False)
+    )
+    runner.recirculation_wavefront_query_start_loc = torch.tensor(
+        [0, 2], dtype=torch.int32
+    )
+    runner.recirculation_wavefront_seq_lens = torch.zeros(1, dtype=torch.int32)
+    return runner
+
+
+def _make_flash_attention_metadata() -> FlashAttentionMetadata:
+    return FlashAttentionMetadata(
+        num_actual_tokens=1,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        max_seq_len=4,
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        slot_mapping=torch.tensor([3], dtype=torch.int64),
+        use_cascade=True,
+        common_prefix_len=2,
+        cu_prefix_query_lens=torch.tensor([0, 1], dtype=torch.int32),
+        prefix_kv_lens=torch.tensor([2], dtype=torch.int32),
+        suffix_kv_lens=torch.tensor([2], dtype=torch.int32),
+        scheduler_metadata=torch.tensor([1], dtype=torch.int32),
+        prefix_scheduler_metadata=torch.tensor([2], dtype=torch.int32),
+        max_num_splits=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("owner", "attribute", "value", "error"),
+    [
+        ("model_config", "runner_type", "pooling", "generation model"),
+        ("scheduler_config", "max_num_seqs", 2, "max_num_seqs=1"),
+        (
+            "scheduler_config",
+            "long_prefill_token_threshold",
+            2,
+            "long_prefill_token_threshold=1",
+        ),
+        ("cache_config", "enable_prefix_caching", True, "prefix caching"),
+        (None, "speculative_config", object(), "speculative decoding"),
+        ("parallel_config", "use_ubatching", True, "microbatching"),
+        (
+            "parallel_config",
+            "decode_context_parallel_size",
+            2,
+            "decode context parallelism",
+        ),
+        ("parallel_config", "data_parallel_size", 2, "data parallelism"),
+        ("pass_config", "enable_sp", True, "sequence parallelism"),
+    ],
+)
+def test_recirculation_wavefront_rejects_unsupported_runner_config(
+    owner: str | None,
+    attribute: str,
+    value: object,
+    error: str,
+) -> None:
+    runner = _make_recirculation_wavefront_runner()
+    if owner == "pass_config":
+        target = runner.compilation_config.pass_config
+    elif owner is None:
+        target = runner
+    else:
+        target = getattr(runner, owner)
+    setattr(target, attribute, value)
+
+    with pytest.raises(ValueError, match=error):
+        runner._validate_recirculation_wavefront_config()
+
+
+def test_recirculation_wavefront_accepts_supported_runner_config() -> None:
+    runner = _make_recirculation_wavefront_runner()
+
+    runner._validate_recirculation_wavefront_config()
+
+
+def test_recirculation_wavefront_replaces_only_upper_attention_metadata() -> None:
+    runner = _make_recirculation_wavefront_runner()
+    runner.recirculation_wavefront_destination_layer = 1
+    layer_names = [f"model.layers.{layer_idx}.self_attn" for layer_idx in range(4)]
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=layer_names)]
+    )
+    original = _make_flash_attention_metadata()
+    attn_metadata = dict.fromkeys(layer_names, original)
+    original_slots = {name: original.slot_mapping for name in layer_names}
+    wavefront_slots = torch.tensor([8, 9], dtype=torch.int64)
+
+    runner._apply_recirculation_wavefront_attention_metadata(
+        attn_metadata,
+        original_slots,
+        {0: wavefront_slots},
+    )
+
+    assert attn_metadata[layer_names[0]] is original
+    assert attn_metadata[layer_names[1]] is original
+    assert attn_metadata[layer_names[2]] is attn_metadata[layer_names[3]]
+    upper = attn_metadata[layer_names[2]]
+    assert upper is not original
+    assert upper.num_actual_tokens == 2
+    assert upper.max_query_len == 2
+    assert not upper.use_cascade
+    assert upper.common_prefix_len == 0
+    assert upper.scheduler_metadata is None
+    assert upper.slot_mapping is wavefront_slots
+    assert original_slots[layer_names[0]] is original.slot_mapping
+    assert original_slots[layer_names[1]] is original.slot_mapping
+    assert original_slots[layer_names[2]] is wavefront_slots
+    assert original_slots[layer_names[3]] is wavefront_slots
+
+
+def test_recirculation_wavefront_rejects_non_flash_attention_backend() -> None:
+    runner = _make_recirculation_wavefront_runner()
+    runner.recirculation_wavefront_destination_layer = 0
+    layer_name = "model.layers.1.self_attn"
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=[layer_name])]
+    )
+
+    with pytest.raises(RuntimeError, match="FlashAttention backend"):
+        runner._apply_recirculation_wavefront_attention_metadata(
+            {layer_name: object()},
+            {layer_name: torch.tensor([3])},
+            {0: torch.tensor([8, 9])},
+        )
+
+
+def test_prepare_recirculation_wavefront_transitions_from_warmup() -> None:
+    class FakeBlockTable:
+        def compute_slot_mapping_into(
+            self,
+            num_reqs: int,
+            query_start_loc: torch.Tensor,
+            positions: torch.Tensor,
+            slot_mapping: torch.Tensor,
+        ) -> None:
+            assert num_reqs == 1
+            torch.testing.assert_close(query_start_loc, torch.tensor([0, 2]))
+            slot_mapping.copy_(positions + 100)
+
+    runner = _make_recirculation_wavefront_runner()
+    runner.device = torch.device("cpu")
+    runner.input_batch = SimpleNamespace(
+        req_ids=["request-0"],
+        num_computed_tokens_cpu=np.array([0]),
+        block_table=[FakeBlockTable()],
+    )
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    runner.seq_lens = torch.tensor([6], dtype=torch.int32)
+    runner.recirculation_wavefront_positions = torch.zeros(2, dtype=torch.int64)
+    runner.recirculation_wavefront_query_start_loc = torch.tensor([0, 2])
+    runner.recirculation_wavefront_seq_lens = torch.zeros(1, dtype=torch.int32)
+    runner.recirculation_wavefront_slot_mappings = {}
+    runner.recirculation_wavefront_request_id = None
+    runner._apply_recirculation_wavefront_attention_metadata = Mock()
+    attn_metadata: dict[str, object] = {}
+    slot_mappings: dict[str, torch.Tensor] = {}
+    positions = torch.tensor([5])
+
+    assert runner._prepare_recirculation_wavefront(
+        attn_metadata,
+        slot_mappings,
+        positions,
+        num_reqs=1,
+        num_tokens_unpadded=1,
+        num_tokens_padded=1,
+        num_scheduled_tokens_np=np.array([1]),
+    )
+    assert runner.recirculation_wavefront_request_id == "request-0"
+
+    runner.input_batch.num_computed_tokens_cpu[0] = 1
+    assert not runner._prepare_recirculation_wavefront(
+        attn_metadata,
+        slot_mappings,
+        positions,
+        num_reqs=1,
+        num_tokens_unpadded=1,
+        num_tokens_padded=1,
+        num_scheduled_tokens_np=np.array([1]),
+    )
+    torch.testing.assert_close(
+        runner.recirculation_wavefront_positions, torch.tensor([4, 5])
+    )
+    torch.testing.assert_close(
+        runner.recirculation_wavefront_seq_lens,
+        torch.tensor([6], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        runner.recirculation_wavefront_slot_mappings[0], torch.tensor([104, 105])
+    )
+    runner._apply_recirculation_wavefront_attention_metadata.assert_called_once_with(
+        attn_metadata,
+        slot_mappings,
+        runner.recirculation_wavefront_slot_mappings,
+    )
+
+
+def test_prepare_recirculation_wavefront_rejects_lost_request_state() -> None:
+    runner = _make_recirculation_wavefront_runner()
+    runner.input_batch = SimpleNamespace(
+        req_ids=["request-1"],
+        num_computed_tokens_cpu=np.array([1]),
+    )
+    runner.recirculation_wavefront_request_id = "request-0"
+
+    with pytest.raises(RuntimeError, match="without its pending recurrent state"):
+        runner._prepare_recirculation_wavefront(
+            {},
+            {},
+            torch.tensor([1]),
+            num_reqs=1,
+            num_tokens_unpadded=1,
+            num_tokens_padded=1,
+            num_scheduled_tokens_np=np.array([1]),
+        )
 
 
 @pytest.mark.parametrize("gc_initially_enabled", [True, False])

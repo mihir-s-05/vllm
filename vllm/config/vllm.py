@@ -46,6 +46,7 @@ from .offload import OffloadConfig
 from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
+from .recirculation import RecirculationConfig
 from .scheduler import SchedulerConfig
 from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
@@ -648,8 +649,22 @@ class VllmConfig:
     @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        recirculation_requested = VllmConfig._recirculation_requested(self)
+        if recirculation_requested and self.speculative_config is not None:
+            raise ValueError(
+                "Recirculation does not support speculative decoding or "
+                "auxiliary hidden-state extraction"
+            )
         if use_v2_model_runner is not None:
+            if use_v2_model_runner and recirculation_requested:
+                raise ValueError(
+                    "Recirculation is not implemented by Model Runner V2; "
+                    "set VLLM_USE_V2_MODEL_RUNNER=0"
+                )
             return use_v2_model_runner
+
+        if recirculation_requested:
+            return False
 
         # PCP runtime support is implemented only by the V2 model runner.
         if self.parallel_config.prefill_context_parallel_size > 1:
@@ -709,6 +724,14 @@ class VllmConfig:
         if draft_config is None:
             return False
         return "DFlash2DraftModel" in (draft_config.architectures or [])
+
+    def _recirculation_requested(self) -> bool:
+        if self.model_config is None:
+            return False
+        hf_config = getattr(self.model_config, "hf_config", None)
+        if hf_config is None:
+            return False
+        return RecirculationConfig.from_hf_config(hf_config) is not None
 
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""
@@ -1129,6 +1152,15 @@ class VllmConfig:
         # Models may have supplied their own DCP defaults above; anything still
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
+
+        if (
+            VllmConfig._recirculation_requested(self)
+            and self.speculative_config is not None
+        ):
+            raise ValueError(
+                "Recirculation does not support speculative decoding or "
+                "auxiliary hidden-state extraction"
+            )
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
