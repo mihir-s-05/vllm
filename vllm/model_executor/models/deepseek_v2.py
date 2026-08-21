@@ -1472,34 +1472,20 @@ class DeepseekV2Model(RecirculationDecoderMixin, nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def _get_llama_4_scaling(
-        self,
-        positions: torch.Tensor,
-    ) -> torch.Tensor | None:
-        llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
-        if llama_4_scaling_config is None:
-            return None
-        return _get_llama_4_scaling(
-            original_max_position_embeddings=llama_4_scaling_config[
-                "original_max_position_embeddings"
-            ],
-            scaling_beta=llama_4_scaling_config["beta"],
-            positions=positions,
-        )
-
     def _forward_recirculation_layer(
         self,
         layer_idx: int,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None = None,
         **layer_kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.layers[layer_idx](
             positions,
             hidden_states,
             residual,
-            self._get_llama_4_scaling(positions),
+            llama_4_scaling,
         )
 
     def forward(
@@ -1529,7 +1515,18 @@ class DeepseekV2Model(RecirculationDecoderMixin, nn.Module):
             residual = intermediate_tensors["residual"]
 
         # Compute llama 4 scaling once per forward pass if enabled
-        llama_4_scaling = self._get_llama_4_scaling(positions)
+        llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
+        llama_4_scaling: torch.Tensor | None
+        if llama_4_scaling_config is not None:
+            llama_4_scaling = _get_llama_4_scaling(
+                original_max_position_embeddings=llama_4_scaling_config[
+                    "original_max_position_embeddings"
+                ],
+                scaling_beta=llama_4_scaling_config["beta"],
+                positions=positions,
+            )
+        else:
+            llama_4_scaling = None
 
         if self.recirculation_config is not None:
             return self._forward_recirculation(
@@ -1539,6 +1536,7 @@ class DeepseekV2Model(RecirculationDecoderMixin, nn.Module):
                 recirculation_wavefront_warmup,
                 recirculation_wavefront_positions,
                 recirculation_wavefront_pending,
+                llama_4_scaling=llama_4_scaling,
             )
 
         aux_hidden_states = []

@@ -334,21 +334,6 @@ class GptOssModel(RecirculationDecoderMixin, nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embedding(input_ids)
 
-    def _forward_recirculation_layer(
-        self,
-        layer_idx: int,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        **layer_kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.layers[layer_idx](
-            hidden_states,
-            positions,
-            residual,
-            **layer_kwargs,
-        )
-
     def forward(
         self,
         input_ids: torch.Tensor | None,

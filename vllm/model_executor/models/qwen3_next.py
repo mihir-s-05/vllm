@@ -618,21 +618,6 @@ class Qwen3NextModel(RecirculationDecoderMixin, nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def _forward_recirculation_layer(
-        self,
-        layer_idx: int,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        **layer_kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.layers[layer_idx](
-            hidden_states=hidden_states,
-            residual=residual,
-            positions=positions,
-            **layer_kwargs,
-        )
-
     def _capture_recirculation_layer_state(
         self, layer_idx: int
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:

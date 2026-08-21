@@ -43,11 +43,7 @@ class RecirculationDecoderMixin:
         config = RecirculationConfig.from_hf_config(hf_config)
         if config is not None and not getattr(hf_config, "is_causal", True):
             raise ValueError("Recirculation requires causal attention")
-        if config is not None and (
-            start_layer != 0
-            or end_layer
-            != RecirculationConfig._get_text_config(hf_config).num_hidden_layers
-        ):
+        if config is not None and (start_layer != 0 or end_layer != len(self.layers)):
             raise ValueError("Recirculation does not support pipeline parallelism")
         if config is not None:
             self._validate_recirculation_model_config(hf_config, config)
@@ -240,9 +236,9 @@ class RecirculationDecoderMixin:
         **layer_kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self.layers[layer_idx](
-            positions,
-            hidden_states,
-            residual,
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
             **layer_kwargs,
         )
 

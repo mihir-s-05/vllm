@@ -3,7 +3,6 @@
 
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any
 
 import torch
 
@@ -19,16 +18,10 @@ class RecirculationConfig:
     ramp_tokens: int = 0
     wavefront: bool = False
 
-    @staticmethod
-    def _get_text_config(hf_config: object) -> object:
-        get_text_config = getattr(hf_config, "get_text_config", None)
-        if callable(get_text_config):
-            return get_text_config()
-        return hf_config
-
     @classmethod
     def from_hf_config(cls, hf_config: object) -> "RecirculationConfig | None":
-        text_config = cls._get_text_config(hf_config)
+        get_text_config = getattr(hf_config, "get_text_config", None)
+        text_config = get_text_config() if callable(get_text_config) else hf_config
         raw_config = getattr(hf_config, "recirculation_config", None)
         if raw_config is None and text_config is not hf_config:
             raw_config = getattr(text_config, "recirculation_config", None)
@@ -92,16 +85,14 @@ class RecirculationConfig:
         if type(self.wavefront) is not bool:
             raise ValueError("wavefront must be a boolean")
 
-        self._validate_coefficient("alpha", self.alpha)
+        coefficients = {"alpha": self.alpha}
         if self.beta is not None:
-            self._validate_coefficient("beta", self.beta)
-
-    @staticmethod
-    def _validate_coefficient(name: str, value: Any) -> None:
-        if isinstance(value, bool) or not isinstance(value, Real):
-            raise ValueError(f"{name} must be a real number")
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"{name} must be between 0 and 1")
+            coefficients["beta"] = self.beta
+        for coefficient_name, coefficient in coefficients.items():
+            if isinstance(coefficient, bool) or not isinstance(coefficient, Real):
+                raise ValueError(f"{coefficient_name} must be a real number")
+            if not 0.0 <= coefficient <= 1.0:
+                raise ValueError(f"{coefficient_name} must be between 0 and 1")
 
     def mix(
         self,
