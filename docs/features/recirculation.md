@@ -44,10 +44,13 @@ the `SupportsRecirculation` interface and use a shared residual-decoder
 execution mixin. This keeps scheduling behavior common while allowing a model
 family to override its layer execution with a specialized implementation.
 
-The reviewed adapters currently cover text-only Gemma 3, the native Llama
-implementation and its direct architecture aliases, and Mistral. An
-unreviewed subclass does not inherit support automatically and fails during
-model loading when Recirculation is requested.
+The reviewed adapters cover Gemma 3/4, Llama and direct aliases, Llama 4,
+Mistral, Mixtral, Qwen 2, Qwen 3, Qwen 3 MoE, DeepSeek V2/V3, GLM-4 MoE,
+GLM-4.7-Flash, GPT-OSS, MiniMax-M2, MiMo-V2, and Step-3.5. Architectures with
+incompatible attention backends use the serial path; ordinary residual
+decoders can also use wavefront execution. An unreviewed subclass does not
+inherit support automatically and fails during model loading when
+Recirculation is requested.
 
 ## Wavefront execution
 
@@ -102,8 +105,9 @@ threshold to sweep the block size and measure the quality-throughput tradeoff.
 
 ## Current restrictions
 
-- Reviewed adapters currently cover text-only Gemma 3, Llama, and Mistral
-  implementations. Multimodal wrappers are not yet supported.
+- Multimodal wrappers are not yet supported.
+- Gemma 4 YOCO fast prefill is unsupported. Gemma 4 per-layer embeddings are
+  serial only.
 - Pipeline parallelism is not supported.
 - Only fixed scalar coefficients and source norm matching are implemented.
 - Wavefront execution currently requires one sequence, one scheduled token per
