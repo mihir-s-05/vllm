@@ -39,6 +39,7 @@ from vllm.config.parallel import EPLBConfig, ParallelConfig
 from vllm.config.pooler import PoolerConfig
 from vllm.config.profiler import ProfilerConfig
 from vllm.config.reasoning import ReasoningConfig
+from vllm.config.recirculation import RecirculationConfig
 from vllm.config.scheduler import SchedulerConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
@@ -119,6 +120,8 @@ __all__ = [
     "PoolerConfig",
     # From vllm.config.reasoning
     "ReasoningConfig",
+    # From vllm.config.recirculation
+    "RecirculationConfig",
     # From vllm.config.scheduler
     "SchedulerConfig",
     # From vllm.config.speculative

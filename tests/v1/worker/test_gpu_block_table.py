@@ -5,12 +5,46 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="requires CUDA",
 )
+
+
+def test_compute_slot_mapping_into_uses_caller_owned_buffer():
+    block_table = BlockTable(
+        block_size=16,
+        max_num_reqs=1,
+        max_num_blocks_per_req=2,
+        max_num_batched_tokens=6,
+        pin_memory=False,
+        device=torch.device("cuda"),
+        kernel_block_size=16,
+        cp_kv_cache_interleave_size=1,
+    )
+    block_table.add_row([3, 7], row_idx=0)
+    block_table.commit_block_table(num_reqs=1)
+    output = torch.full((6,), 999, dtype=torch.int64, device="cuda")
+
+    block_table.compute_slot_mapping_into(
+        num_reqs=1,
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device="cuda"),
+        positions=torch.tensor([0, 15, 16, 17], device="cuda"),
+        slot_mapping=output,
+        max_num_tokens=6,
+    )
+    torch.accelerator.synchronize()
+
+    expected = torch.tensor(
+        [48, 63, 112, 113, PAD_SLOT_ID, PAD_SLOT_ID],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    torch.testing.assert_close(output, expected)
 
 
 def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):

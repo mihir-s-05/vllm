@@ -16,7 +16,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Iterable
-from itertools import islice
 
 import torch
 from torch import nn
@@ -47,7 +46,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
-from .interfaces import SupportsLoRA, SupportsPP
+from .interfaces import SupportsLoRA, SupportsPP, SupportsRecirculation
+from .recirculation import RecirculationCapabilities, RecirculationDecoderMixin
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -289,8 +289,16 @@ class Gemma3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-@support_torch_compile
-class Gemma3Model(nn.Module):
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
+class Gemma3Model(RecirculationDecoderMixin, nn.Module):
+    recirculation_capabilities = RecirculationCapabilities(adapter="gemma3")
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
@@ -309,7 +317,6 @@ class Gemma3Model(nn.Module):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -323,6 +330,7 @@ class Gemma3Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        self._init_recirculation(config, self.start_layer, self.end_layer)
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Normalize the embedding by sqrt(hidden_size)
@@ -346,6 +354,9 @@ class Gemma3Model(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
@@ -358,7 +369,20 @@ class Gemma3Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+
+        if self.recirculation_config is not None:
+            return self._forward_recirculation(
+                positions,
+                hidden_states,
+                residual,
+                recirculation_wavefront_warmup,
+                recirculation_wavefront_positions,
+                recirculation_wavefront_pending,
+                **kwargs,
+            )
+
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -377,7 +401,7 @@ class Gemma3Model(nn.Module):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
-class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsRecirculation):
     hf_to_vllm_mapper = Gemma3Model.hf_to_vllm_mapper
     packed_modules_mapping = {
         "qkv_proj": [
@@ -420,6 +444,13 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.model.has_recirculation_adapter()
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.model.get_recirculation_capabilities()
 
     def forward(
         self,
