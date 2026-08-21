@@ -17,6 +17,7 @@ class RecirculationCapabilities:
     adapter: str
     serial: bool = True
     wavefront: bool = True
+    attn_res_modes: tuple[str, ...] = ()
 
 
 class RecirculationRecurrentStateMetadata(Protocol):
@@ -82,6 +83,13 @@ class RecirculationDecoderMixin:
         if config is not None and (start_layer != 0 or end_layer != len(self.layers)):
             raise ValueError("Recirculation does not support pipeline parallelism")
         if config is not None:
+            if (
+                config.attn_res_mode is not None
+                and config.attn_res_mode not in capabilities.attn_res_modes
+            ):
+                raise ValueError(
+                    f"{capabilities.adapter} does not support attn_res_mode"
+                )
             self._validate_recirculation_model_config(hf_config, config)
         self.recirculation_config = config
 

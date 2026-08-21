@@ -2,16 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import nn
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, RecirculationConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SituAndMul
 from vllm.model_executor.layers.fused_moe import (
@@ -52,6 +53,15 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     SupportsPP,
+    SupportsRecirculation,
+)
+from vllm.model_executor.models.recirculation import (
+    RecirculationCapabilities,
+    RecirculationDecoderMixin,
+    RecirculationRecurrentState,
+    RecirculationRecurrentStateMetadata,
+    capture_recirculation_recurrent_state,
+    restore_recirculation_recurrent_state,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -662,7 +672,13 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum, block_residual
 
 
-class KimiLinearModel(nn.Module, EagleModelMixin):
+class KimiLinearModel(RecirculationDecoderMixin, nn.Module, EagleModelMixin):
+    recirculation_capabilities = RecirculationCapabilities(
+        adapter="kimi_linear_hybrid",
+        wavefront=False,
+        attn_res_modes=("prefix", "bank", "broadcast"),
+    )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -692,6 +708,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        self._init_recirculation(
+            vllm_config.model_config.hf_config,
+            self.start_layer,
+            self.end_layer,
+        )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -716,6 +737,155 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+
+    def _validate_recirculation_model_config(
+        self, _hf_config: object, config: RecirculationConfig
+    ) -> None:
+        if self.config.attn_res_block_size is not None:
+            if config.attn_res_mode is None:
+                raise ValueError("Kimi-K3 AttnRes Recirculation requires attn_res_mode")
+            if config.wavefront:
+                raise ValueError("Kimi-K3 AttnRes Recirculation is serial only")
+        elif config.attn_res_mode is not None:
+            raise ValueError("attn_res_mode requires Kimi-K3 AttnRes")
+
+    def _capture_recirculation_layer_state(
+        self, layer_idx: int
+    ) -> RecirculationRecurrentState | None:
+        attention = getattr(self.layers[layer_idx], "self_attn", None)
+        if not isinstance(
+            attention, (KimiK3DeltaAttention, KimiLinearGatedDeltaNetAttention)
+        ):
+            return None
+
+        forward_context = get_forward_context()
+        if forward_context.attn_metadata is None:
+            return None
+        assert isinstance(forward_context.attn_metadata, dict)
+        metadata = cast(
+            RecirculationRecurrentStateMetadata,
+            forward_context.attn_metadata[attention.prefix],
+        )
+        return capture_recirculation_recurrent_state(attention.kv_cache, metadata)
+
+    def _restore_recirculation_layer_state(
+        self,
+        layer_idx: int,
+        state: RecirculationRecurrentState | None,
+    ) -> None:
+        if state is None:
+            return
+        attention = self.layers[layer_idx].self_attn
+        restore_recirculation_recurrent_state(attention.kv_cache, state)
+
+    def _read_attn_res_boundary(
+        self,
+        layer_idx: int,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        if layer_idx + 1 < self.end_layer:
+            consumer = self.layers[layer_idx + 1]
+            proj = consumer.self_attention_res_proj
+            norm = consumer.self_attention_res_norm
+            num_blocks = consumer.prev_valid_blocks
+        else:
+            proj = self.output_attn_res_proj
+            norm = self.output_attn_res_norm
+            num_blocks = cdiv(self.end_layer, self.config.attn_res_block_size)
+        return _apply_attn_res(
+            prefix_sum,
+            block_residual,
+            proj,
+            norm,
+            num_blocks,
+        )
+
+    def _forward_recirculation_serial(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        config: RecirculationConfig,
+        **layer_kwargs: Any,
+    ) -> torch.Tensor:
+        block_size = self.config.attn_res_block_size
+        if block_size is None:
+            return super()._forward_recirculation_serial(
+                positions,
+                hidden_states,
+                residual,
+                config,
+                **layer_kwargs,
+            )
+
+        assert residual is None
+        num_blocks = cdiv(self.end_layer, block_size)
+        block_residual = hidden_states.new_empty(
+            hidden_states.size(0), num_blocks, hidden_states.size(1)
+        )
+        destination_state = None
+        source_state = None
+        layer_states: dict[int, Any] = {}
+
+        for layer_idx in range(self.start_layer, self.end_layer):
+            if layer_idx > config.destination_layer:
+                layer_states[layer_idx] = self._capture_recirculation_layer_state(
+                    layer_idx
+                )
+            hidden_states, block_residual = self.layers[layer_idx](
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=block_residual,
+                **layer_kwargs,
+            )
+            if layer_idx == config.destination_layer:
+                destination_state = hidden_states
+                if config.attn_res_mode == "broadcast":
+                    destination_state = self._read_attn_res_boundary(
+                        layer_idx, hidden_states, block_residual
+                    )
+            if layer_idx == config.source_layer:
+                source_state = hidden_states
+                if config.attn_res_mode == "broadcast":
+                    source_state = self._read_attn_res_boundary(
+                        layer_idx, hidden_states, block_residual
+                    )
+
+        assert destination_state is not None and source_state is not None
+        normal_output = _apply_attn_res(
+            hidden_states,
+            block_residual,
+            self.output_attn_res_proj,
+            self.output_attn_res_norm,
+            num_blocks,
+        )
+        hidden_states = config.mix_attn_res_state(
+            source_state,
+            destination_state,
+            block_residual,
+            positions,
+            cdiv(config.source_layer + 1, block_size),
+            cdiv(config.destination_layer + 1, block_size),
+        )
+        for layer_idx in range(config.destination_layer + 1, self.end_layer):
+            self._restore_recirculation_layer_state(
+                layer_idx, layer_states.get(layer_idx)
+            )
+            hidden_states, block_residual = self.layers[layer_idx](
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=block_residual,
+                **layer_kwargs,
+            )
+        return normal_output
+
+    def _finalize_recirculation(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return hidden_states if residual is None else hidden_states + residual
 
     def make_empty_intermediate_tensors(
         self,
@@ -763,6 +933,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
@@ -775,6 +948,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+
+        if getattr(self, "recirculation_config", None) is not None:
+            return self._forward_recirculation(
+                positions,
+                hidden_states,
+                residual,
+                recirculation_wavefront_warmup,
+                recirculation_wavefront_positions,
+                recirculation_wavefront_pending,
+            )
 
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, residual
@@ -987,7 +1170,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
 
 
 class KimiLinearForCausalLM(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
+    nn.Module,
+    HasInnerState,
+    SupportsPP,
+    MixtureOfExperts,
+    IsHybrid,
+    SupportsRecirculation,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1016,6 +1204,13 @@ class KimiLinearForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.model.has_recirculation_adapter()
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.model.get_recirculation_capabilities()
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -1030,10 +1225,20 @@ class KimiLinearForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
+            **kwargs,
         )
         return hidden_states
 

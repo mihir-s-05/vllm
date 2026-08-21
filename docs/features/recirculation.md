@@ -56,6 +56,22 @@ Qwen3-Next and Qwen 3.5 are serial-only because their convolution and GDN
 state is updated in place. Their adapters snapshot active state slots before
 the normal upper stack and restore them before the recirculated rerun.
 
+Kimi-Audio, Kimi-VL, and Kimi-K2/K2.5 delegate capability negotiation and
+execution to their reviewed text decoder. Standalone Kimi Linear uses the
+serial recurrent-state path. Production Kimi-K3 uses AttnRes residual banks
+and requires one explicit experimental mapping:
+
+- `"attn_res_mode": "prefix"` mixes the running source and destination
+  prefixes while retaining the destination bank.
+- `"attn_res_mode": "bank"` also right-aligns and mixes corresponding source
+  and destination bank streams.
+- `"attn_res_mode": "broadcast"` mixes the learned AttnRes readouts and
+  broadcasts the result into the destination prefix and valid bank slots.
+
+These mappings are research variants with synthetic execution coverage. None
+has been quality-validated with Kimi-K3 weights or shown equivalent to the
+paper's ordinary residual-stream recurrence.
+
 ## Wavefront execution
 
 Set `"wavefront": true` to execute exact tokenwise Recirculation as a
@@ -114,6 +130,8 @@ threshold to sweep the block size and measure the quality-throughput tradeoff.
   serial only.
 - Qwen3-Next and Qwen 3.5 are serial only and reject sequence-parallel MoE
   execution.
+- Kimi Linear and Kimi-K3 are serial only and reject sequence-parallel
+  execution. Kimi-K3 requires `prefix`, `bank`, or `broadcast` AttnRes mode.
 - Pipeline parallelism is not supported.
 - Only fixed scalar coefficients and source norm matching are implemented.
 - Wavefront execution currently requires one sequence, one scheduled token per

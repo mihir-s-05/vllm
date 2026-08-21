@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import RecirculationConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -69,6 +69,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
+    SupportsRecirculation,
     SupportsReplaySSM,
 )
 from vllm.model_executor.models.kimi_k25 import KimiK25MediaPixelInputs
@@ -76,6 +77,14 @@ from vllm.model_executor.models.kimi_k25_vit import (
     KimiK25MultiModalProjector,
     MoonViT3dPretrainedModel,
     vision_tower_forward,
+)
+from vllm.model_executor.models.recirculation import (
+    RecirculationCapabilities,
+    RecirculationDecoderMixin,
+    RecirculationRecurrentState,
+    RecirculationRecurrentStateMetadata,
+    capture_recirculation_recurrent_state,
+    restore_recirculation_recurrent_state,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -1114,7 +1123,14 @@ class KimiDecoderLayer(nn.Module):
         return hidden_states, prefix_sum, residual
 
 
-class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+class KimiLinearModel(
+    RecirculationDecoderMixin, nn.Module, EagleModelMixin, SupportsQuant
+):
+    recirculation_capabilities = RecirculationCapabilities(
+        adapter="kimi_linear_hybrid",
+        wavefront=False,
+        attn_res_modes=("prefix", "bank", "broadcast"),
+    )
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvgfab": ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"],
@@ -1179,6 +1195,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if self.attn_res_block_size is not None
             else 0
         )
+        self._init_recirculation(
+            vllm_config.model_config.hf_config,
+            self.start_layer,
+            self.end_layer,
+        )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1203,6 +1224,198 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+
+    def _validate_recirculation_model_config(
+        self, _hf_config: object, config: RecirculationConfig
+    ) -> None:
+        if self.use_attn_res:
+            if config.attn_res_mode is None:
+                raise ValueError("Kimi-K3 AttnRes Recirculation requires attn_res_mode")
+            if config.wavefront:
+                raise ValueError("Kimi-K3 AttnRes Recirculation is serial only")
+        elif config.attn_res_mode is not None:
+            raise ValueError("attn_res_mode requires Kimi-K3 AttnRes")
+        if self.use_sequence_parallel:
+            raise ValueError(
+                "Recirculation does not support sequence-parallel Kimi-Linear"
+            )
+
+    def _capture_recirculation_layer_state(
+        self, layer_idx: int
+    ) -> RecirculationRecurrentState | None:
+        attention = getattr(self.layers[layer_idx], "self_attn", None)
+        if not isinstance(
+            attention, (KimiK3DeltaAttention, KimiLinearGatedDeltaNetAttention)
+        ):
+            return None
+
+        forward_context = get_forward_context()
+        if forward_context.attn_metadata is None:
+            return None
+        assert isinstance(forward_context.attn_metadata, dict)
+        metadata = cast(
+            RecirculationRecurrentStateMetadata,
+            forward_context.attn_metadata[attention.prefix],
+        )
+        return capture_recirculation_recurrent_state(attention.kv_cache, metadata)
+
+    def _restore_recirculation_layer_state(
+        self,
+        layer_idx: int,
+        state: RecirculationRecurrentState | None,
+    ) -> None:
+        if state is None:
+            return
+        attention = self.layers[layer_idx].self_attn
+        restore_recirculation_recurrent_state(attention.kv_cache, state)
+
+    def _forward_recirculation_layer(
+        self,
+        layer_idx: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        **layer_kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        hidden_states, prefix_sum, residual = self.layers[layer_idx](
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
+        assert prefix_sum is None
+        return hidden_states, residual
+
+    def _read_attn_res_boundary(
+        self,
+        layer_idx: int,
+        prefix_sum: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> torch.Tensor:
+        if layer_idx + 1 < self.end_layer:
+            consumer = self.layers[layer_idx + 1]
+            score_norm = consumer.self_attention_res_norm
+            score_proj = consumer.self_attention_res_proj
+            num_blocks = consumer.prev_valid_blocks
+        else:
+            score_norm = self.output_attn_res_norm
+            score_proj = self.output_attn_res_proj
+            num_blocks = self.num_attn_res_blocks
+        return attn_res(
+            prefix_sum,
+            None,
+            block_residual,
+            score_norm.weight,
+            score_proj.weight.squeeze(0),
+            None,
+            num_blocks=num_blocks,
+            block_write_idx=-1,
+            eps=score_norm.variance_epsilon,
+            output_norm_eps=0.0,
+        )
+
+    def _forward_recirculation_serial(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        config: RecirculationConfig,
+        **layer_kwargs: Any,
+    ) -> torch.Tensor:
+        if not self.use_attn_res:
+            return super()._forward_recirculation_serial(
+                positions,
+                hidden_states,
+                residual,
+                config,
+                **layer_kwargs,
+            )
+
+        assert residual is None
+        assert self.attn_res_block_size is not None
+        block_residual = hidden_states.new_empty(
+            hidden_states.size(0),
+            self.num_attn_res_blocks,
+            hidden_states.size(1),
+        )
+        prefix_sum = hidden_states
+        pending_mlp_out = None
+        destination_state = None
+        source_state = None
+        layer_states: dict[int, Any] = {}
+
+        for layer_idx in range(self.start_layer, self.end_layer):
+            if layer_idx > config.destination_layer:
+                layer_states[layer_idx] = self._capture_recirculation_layer_state(
+                    layer_idx
+                )
+            pending_mlp_out, prefix_sum, block_residual = self.layers[layer_idx](
+                positions=positions,
+                hidden_states=pending_mlp_out,
+                residual=block_residual,
+                prefix_sum=prefix_sum,
+                **layer_kwargs,
+            )
+            assert prefix_sum is not None
+            boundary = prefix_sum + pending_mlp_out
+            if layer_idx == config.destination_layer:
+                destination_state = boundary
+                if config.attn_res_mode == "broadcast":
+                    destination_state = self._read_attn_res_boundary(
+                        layer_idx, boundary, block_residual
+                    )
+            if layer_idx == config.source_layer:
+                source_state = boundary
+                if config.attn_res_mode == "broadcast":
+                    source_state = self._read_attn_res_boundary(
+                        layer_idx, boundary, block_residual
+                    )
+
+        assert destination_state is not None and source_state is not None
+        normal_output = attn_res(
+            prefix_sum,
+            pending_mlp_out,
+            block_residual,
+            self.output_attn_res_norm.weight,
+            self.output_attn_res_proj.weight.squeeze(0),
+            None,
+            num_blocks=self.num_attn_res_blocks,
+            block_write_idx=-1,
+            eps=self.output_attn_res_norm.variance_epsilon,
+            output_norm_eps=0.0,
+        )
+
+        source_num_blocks = cdiv(config.source_layer + 1, self.attn_res_block_size)
+        destination_num_blocks = cdiv(
+            config.destination_layer + 1, self.attn_res_block_size
+        )
+        prefix_sum = config.mix_attn_res_state(
+            source_state,
+            destination_state,
+            block_residual,
+            positions,
+            source_num_blocks,
+            destination_num_blocks,
+        )
+        pending_mlp_out = None
+        for layer_idx in range(config.destination_layer + 1, self.end_layer):
+            self._restore_recirculation_layer_state(
+                layer_idx, layer_states.get(layer_idx)
+            )
+            pending_mlp_out, prefix_sum, block_residual = self.layers[layer_idx](
+                positions=positions,
+                hidden_states=pending_mlp_out,
+                residual=block_residual,
+                prefix_sum=prefix_sum,
+                **layer_kwargs,
+            )
+        return normal_output
+
+    def _finalize_recirculation(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return hidden_states if residual is None else hidden_states + residual
 
     def make_empty_intermediate_tensors(
         self,
@@ -1315,6 +1528,9 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
@@ -1338,6 +1554,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 )
             hidden_states = sp_shard(hidden_states)
             assert residual is None, "Currently, SP is not supported with PP"
+
+        if getattr(self, "recirculation_config", None) is not None:
+            return self._forward_recirculation(
+                positions,
+                hidden_states,
+                residual,
+                recirculation_wavefront_warmup,
+                recirculation_wavefront_positions,
+                recirculation_wavefront_pending,
+            )
 
         # sharded aux hidden states when sp is enabled
         aux_hidden_states: list[torch.Tensor] = []
@@ -1595,6 +1821,7 @@ class KimiLinearForCausalLM(
     IsHybrid,
     SupportsEagle3,
     SupportsReplaySSM,
+    SupportsRecirculation,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1624,6 +1851,13 @@ class KimiLinearForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.model.has_recirculation_adapter()
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.model.get_recirculation_capabilities()
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -1638,10 +1872,20 @@ class KimiLinearForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         return self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
+            **kwargs,
         )
 
     @classmethod
@@ -1744,10 +1988,18 @@ class KimiK3ForConditionalGeneration(
     HasInnerState,
     IsHybrid,
     SupportsReplaySSM,
+    SupportsRecirculation,
 ):
     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
 
     supports_encoder_tp_data = True
+
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.get_recirculation_capabilities() is not None
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.language_model.get_recirculation_capabilities()
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -2111,6 +2363,9 @@ class KimiK3ForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if intermediate_tensors is not None:
@@ -2120,6 +2375,9 @@ class KimiK3ForConditionalGeneration(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
         )
 
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:

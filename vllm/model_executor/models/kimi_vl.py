@@ -60,6 +60,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsEncoderCudaGraph,
     SupportsMultiModal,
     SupportsPP,
+    SupportsRecirculation,
 )
 from vllm.model_executor.models.moonvit import MoonVitPretrainedModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -85,6 +86,7 @@ from vllm.transformers_utils.configs.kimi_vl import KimiVLConfig, MoonViTConfig
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers
 
+from .recirculation import RecirculationCapabilities
 from .utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
 from .vision import is_vit_use_data_parallel, run_dp_sharded_mrope_vision_model
 
@@ -293,7 +295,11 @@ class KimiVLMultiModalProcessor(BaseMultiModalProcessor[KimiVLProcessingInfo]):
     dummy_inputs=KimiVLDummyInputsBuilder,
 )
 class KimiVLForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsEncoderCudaGraph, SupportsPP
+    nn.Module,
+    SupportsMultiModal,
+    SupportsEncoderCudaGraph,
+    SupportsPP,
+    SupportsRecirculation,
 ):
     supports_encoder_tp_data = True
 
@@ -348,6 +354,13 @@ class KimiVLForConditionalGeneration(
         self.media_placeholder: int = self.config.media_placeholder_token_id
 
         self.model_config = model_config
+
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.get_recirculation_capabilities() is not None
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.language_model.get_recirculation_capabilities()
 
     # -- SupportsEncoderCudaGraph protocol methods --
 
@@ -587,6 +600,9 @@ class KimiVLForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs: object,
     ) -> IntermediateTensors:
         if intermediate_tensors is not None:
@@ -597,6 +613,9 @@ class KimiVLForConditionalGeneration(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
         )
 
         return hidden_states

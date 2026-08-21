@@ -29,6 +29,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsMultiModal,
     SupportsPP,
     SupportsQuant,
+    SupportsRecirculation,
 )
 
 if TYPE_CHECKING:
@@ -72,6 +73,7 @@ from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
 from vllm.utils.import_utils import is_numba_available
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from .recirculation import RecirculationCapabilities
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -303,6 +305,7 @@ class KimiK25ForConditionalGeneration(
     SupportsEagle,
     SupportsEagle3,
     SupportsEncoderCudaGraph,
+    SupportsRecirculation,
 ):
     """Kimi-K2.5 model for conditional generation.
 
@@ -389,6 +392,13 @@ class KimiK25ForConditionalGeneration(
         )
         self.media_placeholder: int = self.config.media_placeholder_token_id
 
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.get_recirculation_capabilities() is not None
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.language_model.get_recirculation_capabilities()
+
     def _maybe_ignore_quant_config(self, quant_config: QuantizationConfig):
         if isinstance(quant_config, compressed_tensors.CompressedTensorsConfig):
             return None
@@ -457,6 +467,9 @@ class KimiK25ForConditionalGeneration(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
         **kwargs: object,
     ) -> IntermediateTensors:
         if intermediate_tensors is not None:
@@ -466,6 +479,9 @@ class KimiK25ForConditionalGeneration(
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
         )
 
         return hidden_states
