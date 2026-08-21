@@ -52,6 +52,9 @@ decoders can also use wavefront execution. An unreviewed subclass does not
 inherit support automatically and fails during model loading when
 Recirculation is requested.
 
+MiniMax-M3 uses a dedicated serial sparse-attention adapter on NVIDIA and AMD
+backends. The initial implementation requires tensor parallel size 1.
+
 ## Wavefront execution
 
 Set `"wavefront": true` to execute exact tokenwise Recirculation as a
@@ -108,6 +111,7 @@ threshold to sweep the block size and measure the quality-throughput tradeoff.
 - Multimodal wrappers are not yet supported.
 - Gemma 4 YOCO fast prefill is unsupported. Gemma 4 per-layer embeddings are
   serial only.
+- MiniMax-M3 is serial only and currently requires tensor parallel size 1.
 - Pipeline parallelism is not supported.
 - Only fixed scalar coefficients and source norm matching are implemented.
 - Wavefront execution currently requires one sequence, one scheduled token per
