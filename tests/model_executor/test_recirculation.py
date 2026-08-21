@@ -10,6 +10,7 @@ from torch import nn
 
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
 from vllm.model_executor.models.gemma4 import Gemma4Model
+from vllm.model_executor.models.glm4 import Glm4ForCausalLM, Glm4Model
 from vllm.model_executor.models.glm4_moe import Glm4MoeModel
 from vllm.model_executor.models.glm4_moe_lite import Glm4MoeLiteModel
 from vllm.model_executor.models.gpt_oss import GptOssModel
@@ -28,6 +29,10 @@ from vllm.model_executor.models.recirculation import (
     RecirculationDecoderMixin,
 )
 from vllm.model_executor.models.step3p5 import Step3p5Model
+from vllm.models.deepseek_v32.nvidia.model import (
+    DeepseekV32ForCausalLM,
+    DeepseekV32Model,
+)
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -262,3 +267,112 @@ def test_gemma4_per_layer_embeddings_are_serial_only() -> None:
     assert capabilities is not None
     assert capabilities.serial
     assert not capabilities.wavefront
+
+
+def test_glm4_top_level_advertises_engine_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, _ = _make_llama_model(monkeypatch, Glm4Model)
+    causal_lm = Glm4ForCausalLM.__new__(Glm4ForCausalLM)
+    nn.Module.__init__(causal_lm)
+    causal_lm.model = model
+
+    assert supports_recirculation(causal_lm)
+
+
+def test_deepseek_v32_top_level_advertises_engine_capability() -> None:
+    model = cast(DeepseekV32Model, object.__new__(DeepseekV32Model))
+    nn.Module.__init__(model)
+    causal_lm = DeepseekV32ForCausalLM.__new__(DeepseekV32ForCausalLM)
+    nn.Module.__init__(causal_lm)
+    causal_lm.model = model
+
+    assert supports_recirculation(causal_lm)
+    capabilities = causal_lm.get_recirculation_capabilities()
+    assert capabilities is not None
+    assert capabilities.adapter == "deepseek_v32_dsa"
+    assert not capabilities.wavefront
+
+
+def test_deepseek_v32_dsa_uses_serial_recirculation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, torch.Tensor | None]] = []
+
+    class DsaLayer(nn.Module):
+        def __init__(self, layer_idx: int) -> None:
+            super().__init__()
+            self.layer_idx = layer_idx
+            self.input_layernorm = nn.LayerNorm(2)
+
+        def forward(
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            residual: torch.Tensor | None,
+            attn_in: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            calls.append((self.layer_idx, attn_in))
+            residual = hidden_states if residual is None else hidden_states + residual
+            return torch.full_like(hidden_states, self.layer_idx + 1), residual
+
+    pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v32.nvidia.model.get_pp_group", lambda: pp_group
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v32.nvidia.model.tensor_model_parallel_all_reduce",
+        lambda hidden_states: hidden_states,
+    )
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v32.nvidia.model.fused_allreduce_rms_norm",
+        lambda hidden_states, residual, norm: norm(hidden_states, residual),
+    )
+    attn_in = torch.full((1, 2), 7.0)
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v32.nvidia.model.fused_embed_norm",
+        lambda *args, **kwargs: (torch.zeros(1, 2), attn_in),
+    )
+
+    model = cast(DeepseekV32Model, object.__new__(DeepseekV32Model))
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(rms_norm_eps=1e-5)
+    model.embed_tokens = nn.Embedding(8, 2)
+    model.replicated_embed = True
+    model.start_layer = 0
+    model.end_layer = 3
+    model.layers = nn.ModuleList([DsaLayer(i) for i in range(3)])
+    model.norm = _FinalNorm()
+    model.use_sequence_parallel = False
+    model.aux_hidden_state_layers = ()
+    model.recirculation_config = RecirculationConfig(
+        source_layer=1,
+        destination_layer=0,
+        alpha=0.2,
+    )
+
+    output = model.forward(
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+    )
+
+    assert isinstance(output, torch.Tensor)
+    torch.testing.assert_close(output, torch.full((1, 2), 6.0))
+    assert [layer_idx for layer_idx, _ in calls] == [0, 1, 2, 1, 2]
+    assert calls[0][1] is attn_in
+    assert all(layer_attn_in is None for _, layer_attn_in in calls[1:])
+
+
+def test_deepseek_v32_dsa_materializes_tp_partial_residual(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v32.nvidia.model.tensor_model_parallel_all_reduce",
+        lambda hidden_states: hidden_states * 2,
+    )
+    hidden_states = torch.ones(1, 2)
+    residual = torch.full((1, 2), 3.0)
+
+    materialized = DeepseekV32Model._materialize_residual(hidden_states, residual)
+
+    torch.testing.assert_close(materialized, torch.full((1, 2), 5.0))

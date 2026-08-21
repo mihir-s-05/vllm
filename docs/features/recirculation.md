@@ -52,6 +52,10 @@ decoders can also use wavefront execution. An unreviewed subclass does not
 inherit support automatically and fails during model loading when
 Recirculation is requested.
 
+DeepSeek-V3.2 and GLM-5-family DSA decoders use a dedicated serial adapter that
+reconstructs tensor-parallel residuals before mixing and does not reuse the
+normal pass's DSA attention input during the rerun.
+
 ## Wavefront execution
 
 Set `"wavefront": true` to execute exact tokenwise Recirculation as a
@@ -108,6 +112,8 @@ threshold to sweep the block size and measure the quality-throughput tradeoff.
 - Multimodal wrappers are not yet supported.
 - Gemma 4 YOCO fast prefill is unsupported. Gemma 4 per-layer embeddings are
   serial only.
+- The DeepSeek-V3.2/GLM-5 DSA adapter is serial only and rejects sequence
+  parallel execution.
 - Pipeline parallelism is not supported.
 - Only fixed scalar coefficients and source norm matching are implemented.
 - Wavefront execution currently requires one sequence, one scheduled token per
