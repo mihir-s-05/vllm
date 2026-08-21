@@ -52,6 +52,10 @@ decoders can also use wavefront execution. An unreviewed subclass does not
 inherit support automatically and fails during model loading when
 Recirculation is requested.
 
+Qwen3-Next and Qwen 3.5 are serial-only because their convolution and GDN
+state is updated in place. Their adapters snapshot active state slots before
+the normal upper stack and restore them before the recirculated rerun.
+
 ## Wavefront execution
 
 Set `"wavefront": true` to execute exact tokenwise Recirculation as a
@@ -108,6 +112,8 @@ threshold to sweep the block size and measure the quality-throughput tradeoff.
 - Multimodal wrappers are not yet supported.
 - Gemma 4 YOCO fast prefill is unsupported. Gemma 4 per-layer embeddings are
   serial only.
+- Qwen3-Next and Qwen 3.5 are serial only and reject sequence-parallel MoE
+  execution.
 - Pipeline parallelism is not supported.
 - Only fixed scalar coefficients and source norm matching are implemented.
 - Wavefront execution currently requires one sequence, one scheduled token per

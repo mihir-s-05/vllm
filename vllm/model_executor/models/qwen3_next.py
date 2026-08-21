@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
+from typing import cast
 
 import torch
 from torch import nn
@@ -17,6 +18,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -63,6 +65,15 @@ from .interfaces import (
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+    SupportsRecirculation,
+)
+from .recirculation import (
+    RecirculationCapabilities,
+    RecirculationDecoderMixin,
+    RecirculationRecurrentState,
+    RecirculationRecurrentStateMetadata,
+    capture_recirculation_recurrent_state,
+    restore_recirculation_recurrent_state,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -541,7 +552,11 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Qwen3NextModel(nn.Module, EagleModelMixin):
+class Qwen3NextModel(RecirculationDecoderMixin, nn.Module, EagleModelMixin):
+    recirculation_capabilities = RecirculationCapabilities(
+        adapter="qwen3_next_hybrid",
+        wavefront=False,
+    )
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
@@ -583,6 +598,15 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        self._init_recirculation(
+            vllm_config.model_config.hf_config,
+            self.start_layer,
+            self.end_layer,
+        )
+        if self.recirculation_config is not None and self.use_sequence_parallel:
+            raise ValueError(
+                "Recirculation does not support sequence-parallel Qwen3-Next"
+            )
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
             Qwen3NextSparseMoeBlock,
@@ -602,6 +626,40 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _capture_recirculation_layer_state(
+        self, layer_idx: int
+    ) -> RecirculationRecurrentState | None:
+        layer = self.layers[layer_idx]
+        if not isinstance(layer, Qwen3NextDecoderLayer) or not hasattr(
+            layer, "linear_attn"
+        ):
+            return None
+
+        forward_context = get_forward_context()
+        if forward_context.attn_metadata is None:
+            return None
+        assert isinstance(forward_context.attn_metadata, dict)
+        metadata = cast(
+            RecirculationRecurrentStateMetadata,
+            forward_context.attn_metadata[layer.linear_attn.prefix],
+        )
+        return capture_recirculation_recurrent_state(
+            layer.linear_attn.kv_cache,
+            metadata,
+        )
+
+    def _restore_recirculation_layer_state(
+        self,
+        layer_idx: int,
+        state: RecirculationRecurrentState | None,
+    ) -> None:
+        if state is None:
+            return
+        layer = self.layers[layer_idx]
+        assert isinstance(layer, Qwen3NextDecoderLayer)
+        assert hasattr(layer, "linear_attn")
+        restore_recirculation_recurrent_state(layer.linear_attn.kv_cache, state)
+
     @property
     def use_sequence_parallel(self) -> bool:
         return self.layers[self.start_layer].use_attn_reduce_scatter_for_moe
@@ -612,6 +670,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -628,6 +689,16 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
             assert residual is None
+
+        if self.recirculation_config is not None:
+            return self._forward_recirculation(
+                positions,
+                hidden_states,
+                residual,
+                recirculation_wavefront_warmup,
+                recirculation_wavefront_positions,
+                recirculation_wavefront_pending,
+            )
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
@@ -726,6 +797,7 @@ class Qwen3NextForCausalLM(
     QwenNextMixtureOfExperts,
     IsHybrid,
     SupportsEagle3,
+    SupportsRecirculation,
 ):
     # MTP weights are loaded by the draft model, not this one.
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"mtp.": None})
@@ -778,16 +850,31 @@ class Qwen3NextForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.model.has_recirculation_adapter()
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.model.get_recirculation_capabilities()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        **kwargs: object,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
         )
 
         return hidden_states

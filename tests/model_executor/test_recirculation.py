@@ -22,7 +22,12 @@ from vllm.model_executor.models.mistral import MistralModel
 from vllm.model_executor.models.mixtral import MixtralModel
 from vllm.model_executor.models.qwen2 import Qwen2Model
 from vllm.model_executor.models.qwen3 import Qwen3Model
+from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeModel
+from vllm.model_executor.models.qwen3_next import (
+    Qwen3NextDecoderLayer,
+    Qwen3NextModel,
+)
 from vllm.model_executor.models.recirculation import (
     RecirculationConfig,
     RecirculationDecoderMixin,
@@ -233,6 +238,8 @@ def test_engine_capability_rejects_incomplete_forward() -> None:
         (Qwen2Model, "qwen2", True),
         (Qwen3Model, "qwen3", True),
         (Qwen3MoeModel, "qwen3_moe", True),
+        (Qwen3NextModel, "qwen3_next_hybrid", False),
+        (Qwen3_5Model, "qwen3_5_hybrid", False),
         (Step3p5Model, "step3p5_moe", True),
     ],
 )
@@ -262,3 +269,48 @@ def test_gemma4_per_layer_embeddings_are_serial_only() -> None:
     assert capabilities is not None
     assert capabilities.serial
     assert not capabilities.wavefront
+
+
+def test_qwen_next_restores_active_gdn_state_before_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLinearAttention(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prefix = "model.layers.0.linear_attn"
+            self.kv_cache = (
+                torch.arange(12, dtype=torch.float32).reshape(3, 4),
+                torch.arange(18, dtype=torch.float32).reshape(3, 2, 3),
+            )
+
+    layer = cast(Qwen3NextDecoderLayer, object.__new__(Qwen3NextDecoderLayer))
+    nn.Module.__init__(layer)
+    layer.linear_attn = FakeLinearAttention()
+    model = cast(Qwen3NextModel, object.__new__(Qwen3NextModel))
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList([layer])
+    metadata = SimpleNamespace(
+        spec_sequence_masks=None,
+        non_spec_state_indices_tensor=torch.tensor([2, 0], dtype=torch.int64),
+        num_prefills=1,
+        num_decodes=1,
+    )
+    context = SimpleNamespace(attn_metadata={"model.layers.0.linear_attn": metadata})
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_next.get_forward_context",
+        lambda: context,
+    )
+
+    snapshot = model._capture_recirculation_layer_state(0)
+    untouched = tuple(state[1].clone() for state in layer.linear_attn.kv_cache)
+    for state in layer.linear_attn.kv_cache:
+        state.add_(100)
+    model._restore_recirculation_layer_state(0, snapshot)
+
+    assert snapshot is not None
+    state_indices, captured = snapshot
+    for cache, saved, untouched_row in zip(
+        layer.linear_attn.kv_cache, captured, untouched
+    ):
+        torch.testing.assert_close(cache.index_select(0, state_indices), saved)
+        torch.testing.assert_close(cache[1], untouched_row + 100)
