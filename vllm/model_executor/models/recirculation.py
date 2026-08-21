@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,42 @@ class RecirculationCapabilities:
     adapter: str
     serial: bool = True
     wavefront: bool = True
+
+
+class RecirculationRecurrentStateMetadata(Protocol):
+    """Metadata needed to snapshot active recurrent-cache rows."""
+
+    spec_sequence_masks: torch.Tensor | None
+    non_spec_state_indices_tensor: torch.Tensor | None
+    num_prefills: int
+    num_decodes: int
+
+
+RecirculationRecurrentState = tuple[torch.Tensor, tuple[torch.Tensor, ...]]
+
+
+def capture_recirculation_recurrent_state(
+    kv_cache: tuple[torch.Tensor, ...],
+    metadata: RecirculationRecurrentStateMetadata,
+) -> RecirculationRecurrentState:
+    if metadata.spec_sequence_masks is not None:
+        raise RuntimeError("Recirculation does not support speculative recurrent state")
+    state_indices = metadata.non_spec_state_indices_tensor
+    if state_indices is None:
+        raise RuntimeError("Recirculation requires recurrent state indices")
+    num_requests = metadata.num_prefills + metadata.num_decodes
+    state_indices = state_indices[:num_requests].long()
+    snapshots = tuple(state.index_select(0, state_indices) for state in kv_cache)
+    return state_indices, snapshots
+
+
+def restore_recirculation_recurrent_state(
+    kv_cache: tuple[torch.Tensor, ...],
+    state: RecirculationRecurrentState,
+) -> None:
+    state_indices, snapshots = state
+    for cache, snapshot in zip(kv_cache, snapshots):
+        cache.index_copy_(0, state_indices, snapshot)
 
 
 class RecirculationDecoderMixin:
