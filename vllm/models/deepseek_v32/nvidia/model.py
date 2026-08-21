@@ -8,7 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_embed_norm import (
     fused_embed_norm,
@@ -29,6 +29,10 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MoE,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
+)
+from vllm.model_executor.models.recirculation import (
+    RecirculationCapabilities,
+    RecirculationDecoderMixin,
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
@@ -160,7 +164,11 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         return hidden_states, residual
 
 
-class DeepseekV32Model(torch.nn.Module):
+class DeepseekV32Model(RecirculationDecoderMixin, torch.nn.Module):
+    recirculation_capabilities = RecirculationCapabilities(
+        adapter="deepseek_v32_dsa",
+        wavefront=False,
+    )
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -211,6 +219,11 @@ class DeepseekV32Model(torch.nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        self._init_recirculation(config, self.start_layer, self.end_layer)
+        if self.recirculation_config is not None and self.use_sequence_parallel:
+            raise ValueError(
+                "Recirculation does not support sequence-parallel DeepSeek DSA models"
+            )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -226,12 +239,48 @@ class DeepseekV32Model(torch.nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _forward_recirculation_layer(
+        self,
+        layer_idx: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        attn_in: torch.Tensor | None = None,
+        **layer_kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.layers[layer_idx](
+            positions,
+            hidden_states,
+            residual,
+            attn_in if layer_idx == self.start_layer else None,
+        )
+
+    def _finalize_recirculation(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert residual is not None
+        hidden_states, _ = fused_allreduce_rms_norm(hidden_states, residual, self.norm)
+        return hidden_states
+
+    @staticmethod
+    def _materialize_residual(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert residual is not None
+        return tensor_model_parallel_all_reduce(hidden_states) + residual
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         attn_in = None
         if get_pp_group().is_first_rank:
@@ -268,6 +317,17 @@ class DeepseekV32Model(torch.nn.Module):
             if attn_in is not None:
                 attn_in = sp_shard(attn_in)
             assert residual is None, "Currently, SP is not supported with PP"
+
+        if self.recirculation_config is not None:
+            return self._forward_recirculation(
+                positions,
+                hidden_states,
+                residual,
+                recirculation_wavefront_warmup,
+                recirculation_wavefront_positions,
+                recirculation_wavefront_pending,
+                attn_in=attn_in,
+            )
 
         aux_hidden_states = []
         for idx, layer in enumerate(

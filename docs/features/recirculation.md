@@ -48,8 +48,8 @@ The reviewed text adapters cover the following residual-decoder families:
 
 | Execution | Families |
 | --- | --- |
-| Serial and wavefront | Gemma 3, Gemma 4, Llama and direct aliases, Llama 4, Mistral, Mixtral, Qwen 2, Qwen 3, Qwen 3 MoE, GLM-4 MoE, MiniMax-M2, MiMo-V2, Step-3.5 |
-| Serial only | DeepSeek V2/V3/V3.2, GLM-4.7-Flash, GPT-OSS, MiniMax-M3, Qwen3-Next, Qwen 3.5 dense and MoE |
+| Serial and wavefront | Gemma 3, Gemma 4, Llama and direct aliases, Llama 4, Mistral, Mixtral, Qwen 2, Qwen 3, Qwen 3 MoE, GLM-4 dense and MoE, MiniMax-M2, MiMo-V2, Step-3.5 |
+| Serial only | DeepSeek V2/V3/V3.2, GLM-4.7-Flash, GLM-5/5.1/5.2, GPT-OSS, MiniMax-M3, Qwen3-Next, Qwen 3.5 dense and MoE |
 
 Serial-only status is deliberate when the architecture uses an attention
 backend that cannot consume the engine's two-token FlashAttention wavefront,
@@ -130,7 +130,8 @@ threshold to sweep the block size and measure the quality-throughput tradeoff.
   Defining recurrence over draft-token blocks and auxiliary states requires a
   separate design. Qwen3-Next and Qwen 3.5 additionally reject
   sequence-parallel MoE execution; their recurrent-state adapter is serial
-  only.
+  only. The optimized DeepSeek-V3.2/GLM-5 DSA adapter also rejects
+  sequence-parallel execution and is serial only.
 - MiniMax-M3 currently requires tensor-parallel size 1. Its sparse-attention
   backend is serial only.
 - Gemma 4 YOCO fast prefill is unsupported. Gemma 4 per-layer embeddings are
