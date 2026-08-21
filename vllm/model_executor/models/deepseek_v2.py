@@ -114,7 +114,9 @@ from .interfaces import (
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+    SupportsRecirculation,
 )
+from .recirculation import RecirculationCapabilities, RecirculationDecoderMixin
 from .utils import (
     PPMissingLayer,
     get_pp_missing_layer_names,
@@ -1393,7 +1395,11 @@ class DeepseekV2DecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class DeepseekV2Model(nn.Module):
+class DeepseekV2Model(RecirculationDecoderMixin, nn.Module):
+    recirculation_capabilities = RecirculationCapabilities(
+        adapter="deepseek_moe",
+        wavefront=False,
+    )
     fall_back_to_pt_during_load = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -1435,6 +1441,13 @@ class DeepseekV2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        self._init_recirculation(config, self.start_layer, self.end_layer)
+        if self.recirculation_config is not None and any(
+            layer.use_sequence_parallel_moe for layer in self.layers
+        ):
+            raise ValueError(
+                "Recirculation does not support sequence-parallel DeepSeek models"
+            )
 
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
@@ -1465,12 +1478,31 @@ class DeepseekV2Model(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def _forward_recirculation_layer(
+        self,
+        layer_idx: int,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None = None,
+        **layer_kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.layers[layer_idx](
+            positions,
+            hidden_states,
+            residual,
+            llama_4_scaling,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1501,6 +1533,17 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             llama_4_scaling = None
+
+        if self.recirculation_config is not None:
+            return self._forward_recirculation(
+                positions,
+                hidden_states,
+                residual,
+                recirculation_wavefront_warmup,
+                recirculation_wavefront_positions,
+                recirculation_wavefront_pending,
+                llama_4_scaling=llama_4_scaling,
+            )
 
         aux_hidden_states = []
         for idx, layer in enumerate(
@@ -1836,6 +1879,7 @@ class DeepseekV2ForCausalLM(
     SupportsLoRA,
     SupportsEagle,
     SupportsEagle3,
+    SupportsRecirculation,
 ):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1922,15 +1966,31 @@ class DeepseekV2ForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    @property
+    def supports_recirculation(self) -> bool:
+        return self.model.has_recirculation_adapter()
+
+    def get_recirculation_capabilities(self) -> RecirculationCapabilities | None:
+        return self.model.get_recirculation_capabilities()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        recirculation_wavefront_warmup: bool | None = None,
+        recirculation_wavefront_positions: torch.Tensor | None = None,
+        recirculation_wavefront_pending: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            recirculation_wavefront_warmup=recirculation_wavefront_warmup,
+            recirculation_wavefront_positions=recirculation_wavefront_positions,
+            recirculation_wavefront_pending=recirculation_wavefront_pending,
         )
         return hidden_states
 

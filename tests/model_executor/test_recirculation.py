@@ -8,10 +8,26 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
+from vllm.model_executor.models.gemma4 import Gemma4Model
+from vllm.model_executor.models.glm4_moe import Glm4MoeModel
+from vllm.model_executor.models.glm4_moe_lite import Glm4MoeLiteModel
+from vllm.model_executor.models.gpt_oss import GptOssModel
 from vllm.model_executor.models.interfaces import supports_recirculation
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaModel
+from vllm.model_executor.models.llama4 import Llama4Model
+from vllm.model_executor.models.mimo_v2 import MiMoV2Model
+from vllm.model_executor.models.minimax_m2 import MiniMaxM2Model
 from vllm.model_executor.models.mistral import MistralModel
-from vllm.model_executor.models.recirculation import RecirculationConfig
+from vllm.model_executor.models.mixtral import MixtralModel
+from vllm.model_executor.models.qwen2 import Qwen2Model
+from vllm.model_executor.models.qwen3 import Qwen3Model
+from vllm.model_executor.models.qwen3_moe import Qwen3MoeModel
+from vllm.model_executor.models.recirculation import (
+    RecirculationConfig,
+    RecirculationDecoderMixin,
+)
+from vllm.model_executor.models.step3p5 import Step3p5Model
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -200,3 +216,49 @@ def test_engine_capability_rejects_incomplete_forward() -> None:
             return input_ids
 
     assert not supports_recirculation(IncompleteModel())
+
+
+@pytest.mark.parametrize(
+    ("model_type", "adapter", "wavefront"),
+    [
+        (DeepseekV2Model, "deepseek_moe", False),
+        (Gemma4Model, "gemma4", True),
+        (Glm4MoeModel, "glm4_moe", True),
+        (Glm4MoeLiteModel, "glm4_moe_lite", False),
+        (GptOssModel, "gpt_oss_moe", False),
+        (Llama4Model, "llama4_moe", True),
+        (MiniMaxM2Model, "minimax_m2_moe", True),
+        (MiMoV2Model, "mimo_v2_moe", True),
+        (MixtralModel, "mixtral", True),
+        (Qwen2Model, "qwen2", True),
+        (Qwen3Model, "qwen3", True),
+        (Qwen3MoeModel, "qwen3_moe", True),
+        (Step3p5Model, "step3p5_moe", True),
+    ],
+)
+def test_reviewed_family_capabilities(
+    model_type: type[RecirculationDecoderMixin],
+    adapter: str,
+    wavefront: bool,
+) -> None:
+    model = cast(RecirculationDecoderMixin, object.__new__(model_type))
+    if isinstance(model, Gemma4Model):
+        model.hidden_size_per_layer_input = 0
+
+    capabilities = model.get_recirculation_capabilities()
+
+    assert capabilities is not None
+    assert capabilities.adapter == adapter
+    assert capabilities.serial
+    assert capabilities.wavefront is wavefront
+
+
+def test_gemma4_per_layer_embeddings_are_serial_only() -> None:
+    model = cast(Gemma4Model, object.__new__(Gemma4Model))
+    model.hidden_size_per_layer_input = 16
+
+    capabilities = model.get_recirculation_capabilities()
+
+    assert capabilities is not None
+    assert capabilities.serial
+    assert not capabilities.wavefront
